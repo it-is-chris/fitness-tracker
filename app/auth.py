@@ -1,0 +1,34 @@
+from datetime import datetime, timedelta, timezone
+
+import bcrypt
+import jwt
+
+from app.config import settings
+
+
+def hash_password(password: str) -> str:
+    return bcrypt.hashpw(password.encode(), bcrypt.gensalt()).decode()
+
+
+def verify_password(plain_password: str, hashed_password: str) -> bool:
+    return bcrypt.checkpw(plain_password.encode(), hashed_password.encode())
+
+
+def create_access_token(user_id: int) -> str:
+    expire = datetime.now(timezone.utc) + timedelta(
+        minutes=settings.access_token_expire_minutes
+    )
+    payload = {"sub": str(user_id), "exp": expire}
+    return jwt.encode(payload, settings.secret_key, algorithm=settings.algorithm)
+
+
+def decode_access_token(token: str) -> int | None:
+    """Returns user_id if token is valid, None otherwise."""
+    try:
+        payload = jwt.decode(
+            token, settings.secret_key, algorithms=[settings.algorithm]
+        )
+        user_id = payload.get("sub")
+        return int(user_id) if user_id else None
+    except (jwt.InvalidTokenError, ValueError):
+        return None
