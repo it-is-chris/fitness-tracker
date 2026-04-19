@@ -8,7 +8,7 @@ A REST API for tracking workouts, exercises, and personal records.
 - **Database**: PostgreSQL (via asyncpg)
 - **ORM**: SQLAlchemy 2.0 (async) + Alembic migrations
 - **Auth**: JWT (PyJWT) + bcrypt password hashing
-- **Testing**: pytest + httpx (async, in-memory SQLite)
+- **Testing**: pytest + httpx (async) against a real Postgres container (testcontainers)
 - **Containerisation**: Docker + docker-compose
 - **CI**: GitHub Actions (tests + image build on every PR)
 - **Observability**: structured request logging, configurable log level, optional SQL echo
@@ -81,11 +81,16 @@ Environment variables (set in `.env`):
 
 ## Running Tests
 
-Tests use an in-memory SQLite database — no Postgres needed. `conftest.py` sets the required env vars automatically.
+Tests run against a real Postgres 16 container via [testcontainers](https://testcontainers.com/) — this avoids the SQLite/Postgres divergences (timezone-aware timestamps, `VARCHAR(n)` enforcement, collation-dependent `LOWER()`, float precision) that can let bugs pass tests and fail in production.
+
+Each test runs inside a transaction that gets rolled back at the end, so tests are isolated without the cost of recreating tables every time.
 
 ```bash
+docker info > /dev/null   # Docker must be running
 pytest -v
 ```
+
+The first run takes a few extra seconds while the Postgres image starts; subsequent runs reuse the cached image.
 
 ## Debugging
 

@@ -1,44 +1,75 @@
+import asyncio
+import atexit
 import os
 
-# Override settings BEFORE any app imports so config.py reads these
-os.environ["DATABASE_URL"] = "sqlite+aiosqlite:///:memory:"
-os.environ["SECRET_KEY"] = "test-secret-not-for-production"
+from sqlalchemy.engine.url import make_url
+from sqlalchemy.pool import NullPool
+from testcontainers.postgres import PostgresContainer
 
-import pytest_asyncio  # noqa: E402
-from app.config import settings  # noqa: E402
-from app.database import Base, get_db  # noqa: E402
-from app.main import app  # noqa: E402
-from httpx import ASGITransport, AsyncClient  # noqa: E402
-from sqlalchemy.ext.asyncio import (  # noqa: E402
-    AsyncSession,
-    async_sessionmaker,
-    create_async_engine,
+# --- Bootstrap: start a Postgres container and create the schema BEFORE any
+# app imports, so Pydantic settings read the correct DATABASE_URL. ---
+
+_postgres = PostgresContainer("postgres:16").start()
+atexit.register(_postgres.stop)
+
+_async_url = (
+    make_url(_postgres.get_connection_url())
+    .set(drivername="postgresql+asyncpg")
+    .render_as_string(hide_password=False)
 )
 
-engine = create_async_engine(settings.database_url)
-test_session = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+os.environ["DATABASE_URL"] = _async_url
+os.environ["SECRET_KEY"] = "test-secret-not-for-production"
+
+# --- Now safe to import app modules. ---
+
+import pytest_asyncio  # noqa: E402
+from httpx import ASGITransport, AsyncClient  # noqa: E402
+from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine  # noqa: E402
+
+from app.database import Base, get_db  # noqa: E402
+from app.main import app  # noqa: E402
+
+# NullPool means each engine.connect() opens a fresh asyncpg connection,
+# so we don't reuse connections across function-scoped event loops.
+engine = create_async_engine(_async_url, poolclass=NullPool)
 
 
-@pytest_asyncio.fixture(autouse=True)
-async def setup_database():
-    """Create all tables before each test, drop after."""
+async def _create_schema() -> None:
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
-    yield
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.drop_all)
+
+
+asyncio.run(_create_schema())
 
 
 @pytest_asyncio.fixture
 async def db():
-    """Yield a test database session."""
-    async with test_session() as session:
-        yield session
+    """Per-test DB session wrapped in a transaction that gets rolled back.
+
+    `join_transaction_mode="create_savepoint"` turns any `session.commit()`
+    inside the app into a SAVEPOINT release instead of a real commit, so the
+    outer transaction is still live at test end and `rollback()` wipes
+    everything cleanly — without the cost of recreating tables per test.
+    """
+    async with engine.connect() as connection:
+        transaction = await connection.begin()
+        session = AsyncSession(
+            bind=connection,
+            expire_on_commit=False,
+            join_transaction_mode="create_savepoint",
+        )
+        try:
+            yield session
+        finally:
+            await session.close()
+            await transaction.rollback()
 
 
 @pytest_asyncio.fixture
 async def client(db: AsyncSession):
-    """Async test client with database dependency overridden."""
+    """Async test client with the DB dependency overridden to share our
+    transaction-bound session."""
 
     async def override_get_db():
         try:
@@ -59,7 +90,7 @@ async def client(db: AsyncSession):
 
 @pytest_asyncio.fixture
 async def auth_headers(client: AsyncClient) -> dict:
-    """Register a test user and return auth headers with JWT token."""
+    """Register a test user and return auth headers with a JWT token."""
     await client.post(
         "/api/auth/register",
         json={
